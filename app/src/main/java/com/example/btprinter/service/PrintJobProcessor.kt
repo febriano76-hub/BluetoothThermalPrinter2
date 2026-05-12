@@ -9,16 +9,20 @@ import android.util.Log
 import com.example.btprinter.BluetoothPrinter
 import com.example.btprinter.EscPos
 import com.example.btprinter.util.ImageToEscPos
-import java.io.FileDescriptor
+import java.io.File
 
 /**
- * v2.1.1: fix compile error (nullable bitmap), pakai local non-null val.
+ * v2.8 FIX "file descriptor not seekable":
+ *  - PdfRenderer butuh seekable PFD. Print Framework kasih FD pipe yang
+ *    tidak seekable, jadi PdfRenderer langsung throw IOException.
+ *  - Solusi: terima File regular (sudah di-copy dari pipe oleh caller),
+ *    buka ParcelFileDescriptor dari File itu — file regular selalu
+ *    seekable. ParcelFileDescriptor.open(File, MODE_READ_ONLY) clean
+ *    daripada dup() FD streaming.
  *
- * v2.1 improvements:
- *  - Catch Throwable (bukan cuma Exception) untuk handle OOM
- *  - Pakai RGB_565 (16-bit) instead of ARGB_8888 (32-bit) → halve memory
- *  - Pakai RENDER_MODE_FOR_DISPLAY (lebih kompatibel dari FOR_PRINT)
- *  - Pesan error lebih detail di setiap step
+ * v2.1.1: nullable bitmap compile fix
+ * v2.1: catch Throwable (OOM), RGB_565 instead of ARGB_8888,
+ *  RENDER_MODE_FOR_DISPLAY, pesan error detail
  */
 class PrintJobProcessor(
     private val targetWidthPx: Int = 384,
@@ -30,21 +34,35 @@ class PrintJobProcessor(
         private const val CHUNK_HEIGHT_PX = 128
     }
 
-    suspend fun process(fileDescriptor: FileDescriptor): Result<Unit> {
+    /**
+     * v2.8: terima File (bukan FileDescriptor). Caller harus salin PDF
+     * dari pipe FD ke file regular (di cacheDir) sebelum memanggil ini.
+     */
+    suspend fun process(pdfFile: File): Result<Unit> {
         var renderer: PdfRenderer? = null
         var pfd: ParcelFileDescriptor? = null
 
         try {
+            if (!pdfFile.exists() || pdfFile.length() == 0L) {
+                return Result.failure(RuntimeException(
+                    "PDF file kosong atau tidak ada: ${pdfFile.absolutePath}"
+                ))
+            }
+
             pfd = try {
-                ParcelFileDescriptor.dup(fileDescriptor)
+                ParcelFileDescriptor.open(pdfFile, ParcelFileDescriptor.MODE_READ_ONLY)
             } catch (t: Throwable) {
-                return Result.failure(RuntimeException("dup FD: ${t.message}", t))
+                return Result.failure(RuntimeException(
+                    "Open PDF file: ${t.message}", t
+                ))
             }
 
             renderer = try {
                 PdfRenderer(pfd!!)
             } catch (t: Throwable) {
-                return Result.failure(RuntimeException("PdfRenderer: ${t.message}", t))
+                return Result.failure(RuntimeException(
+                    "PdfRenderer: ${t.message}", t
+                ))
             }
 
             val r = renderer!!
@@ -95,7 +113,6 @@ class PrintJobProcessor(
                 ))
             }
 
-            // FIX v2.1.1: pakai local non-null val supaya Kotlin tidak komplain
             val pageObj: PdfRenderer.Page = page!!
 
             val pageWidth = pageObj.width
@@ -118,7 +135,6 @@ class PrintJobProcessor(
                 Log.w(TAG, "Capping height: $targetHeight → $actualHeight")
             }
 
-            // FIX v2.1.1: pakai local non-null val
             val bm: Bitmap = try {
                 Bitmap.createBitmap(targetWidthPx, actualHeight, Bitmap.Config.RGB_565)
             } catch (t: Throwable) {
@@ -126,7 +142,7 @@ class PrintJobProcessor(
                     "createBitmap(${targetWidthPx}x${actualHeight}): ${t.message}", t
                 ))
             }
-            bitmap = bm  // simpan reference untuk cleanup di finally
+            bitmap = bm
 
             Canvas(bm).drawColor(Color.WHITE)
 

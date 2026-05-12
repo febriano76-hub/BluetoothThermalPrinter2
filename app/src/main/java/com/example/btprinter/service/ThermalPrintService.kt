@@ -17,15 +17,19 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
 
 /**
- * v2.7 FIX compile error: hilangkan type annotation nullable yang
- *  mencegah smart-cast setelah `?: return`. Sekarang inline pakai
- *  helper function dan return ParcelFileDescriptor langsung tanpa
- *  wrapper class — lebih bersih dan compile-friendly.
+ * v2.8 FIX "file descriptor not seekable":
+ *  - Print Framework kasih pipe FD (streaming) tapi PdfRenderer butuh
+ *    seekable FD. Sebelum process, salin isi pipe ke file regular di
+ *    cacheDir, lalu kasih File itu ke processor.
+ *  - Cleanup temp file di finally block.
  *
- * v2.6: Fix "must be called from the main thread" — document.data
- *  diakses di Main, file descriptor dipass ke IO.
+ * v2.7: Smart-cast fix, helper function untuk readability.
+ * v2.6: document.data diakses di Main thread.
  * v2.5: Reuse koneksi yang sudah dibuat MainActivity.
  * v2.4: PrintJob lifecycle dari Main thread, retry logic.
  */
@@ -70,41 +74,29 @@ class ThermalPrintService : PrintService() {
     }
 
     override fun onPrintJobQueued(printJob: PrintJob) {
-        // onPrintJobQueued sendiri sudah di main thread (callback dari framework)
         Log.d(TAG, "Job queued: ${printJob.info.label}, " +
                 "${printJob.document.info.pageCount} pages")
         scope.launch { runJob(printJob) }
     }
 
     private suspend fun runJob(printJob: PrintJob) {
-        // ===== STEP 1: Main thread - validate state, fetch pfd, start =====
         val pfd = withContext(Dispatchers.Main) {
             prepareAndStart(printJob)
-        } ?: return  // pfd sekarang non-null (smart-cast lewat ?: return)
+        } ?: return
 
-        // ===== STEP 2: IO thread - lakukan kerja =====
         val result: Result<Unit> = try {
             doPrintJob(pfd)
         } catch (t: Throwable) {
             Result.failure(t)
         } finally {
-            // Tutup pfd kita (PrintJobProcessor sudah pakai dup-nya sendiri)
             try { pfd.close() } catch (_: Throwable) {}
         }
 
-        // ===== STEP 3: Main thread - mark complete / fail =====
         withContext(Dispatchers.Main) {
             finishJob(printJob, result)
         }
-
-        // v2.5: JANGAN disconnect di akhir job — biarkan koneksi hidup
     }
 
-    /**
-     * Validasi state, ambil ParcelFileDescriptor, dan start job.
-     * HARUS dipanggil dari Main thread.
-     * @return PFD kalau sukses, null kalau gagal (sudah mark fail() internal)
-     */
     private fun prepareAndStart(printJob: PrintJob): ParcelFileDescriptor? {
         return try {
             if (!printJob.isQueued) {
@@ -141,10 +133,6 @@ class ThermalPrintService : PrintService() {
         }
     }
 
-    /**
-     * Mark print job sebagai complete atau fail.
-     * HARUS dipanggil dari Main thread.
-     */
     private fun finishJob(printJob: PrintJob, result: Result<Unit>) {
         if (result.isSuccess) {
             Log.d(TAG, "Job sukses")
@@ -197,15 +185,43 @@ class ThermalPrintService : PrintService() {
             }
         }
 
-        Log.d(TAG, "Processing PDF (target=${prefs.targetWidthPx}px)...")
-        val processor = PrintJobProcessor(prefs.targetWidthPx)
+        // ===== v2.8: Salin pipe FD ke temp file (seekable) =====
+        Log.d(TAG, "Copy PDF dari pipe FD ke temp file...")
+        val tempFile = try {
+            copyPfdToTempFile(pfd)
+        } catch (t: Throwable) {
+            return Result.failure(RuntimeException(
+                "Copy PDF ke temp: ${t.message}", t
+            ))
+        }
+        Log.d(TAG, "Temp file: ${tempFile.absolutePath} (${tempFile.length()} bytes)")
+
         return try {
-            processor.process(pfd.fileDescriptor)
+            Log.d(TAG, "Processing PDF (target=${prefs.targetWidthPx}px)...")
+            val processor = PrintJobProcessor(prefs.targetWidthPx)
+            processor.process(tempFile)
         } catch (t: Throwable) {
             Result.failure(RuntimeException(
                 "Proses PDF: ${t.javaClass.simpleName}: ${t.message}", t
             ))
+        } finally {
+            try { tempFile.delete() } catch (_: Throwable) {}
         }
+    }
+
+    /**
+     * Salin isi ParcelFileDescriptor (yang mungkin pipe / non-seekable)
+     * ke file regular di cacheDir. File regular selalu seekable, jadi
+     * aman untuk PdfRenderer.
+     */
+    private fun copyPfdToTempFile(pfd: ParcelFileDescriptor): File {
+        val tempFile = File.createTempFile("printjob_", ".pdf", cacheDir)
+        FileInputStream(pfd.fileDescriptor).use { input ->
+            FileOutputStream(tempFile).use { output ->
+                input.copyTo(output)
+            }
+        }
+        return tempFile
     }
 
     private suspend fun connectWithRetry(
