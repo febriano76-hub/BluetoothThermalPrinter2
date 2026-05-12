@@ -13,16 +13,12 @@ import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
+ * v2.4: Tambah property `connectedMac` supaya caller bisa cek apakah
+ * koneksi current sudah ke device yang diinginkan, tanpa perlu disconnect+
+ * reconnect. Ini critical untuk Print Service yang harus reuse koneksi
+ * yang sudah dibuat MainActivity.
+ *
  * v2.3: Bluetooth connect/write pakai WATCHDOG THREAD untuk paksa timeout.
- *
- * Latar belakang: BluetoothSocket.connect() dan OutputStream.write() adalah
- * blocking native call. Kotlin withTimeout() hanya bisa cancel coroutine
- * kooperatif — tidak bisa interrupt JVM thread yang stuck di native code.
- * Akibatnya kalau Bluetooth hang, withTimeout tidak ngefek → job stuck forever.
- *
- * Solusi: thread terpisah (watchdog) yang sleep selama timeoutMs, lalu
- * force-close socket dari luar. Ini menyebabkan blocking native call throw
- * IOException, dan flow bisa lanjut.
  */
 object BluetoothPrinter {
 
@@ -34,6 +30,18 @@ object BluetoothPrinter {
 
     val isConnected: Boolean
         get() = socket?.isConnected == true
+
+    /**
+     * MAC address printer yang sedang terhubung, atau null kalau belum connect.
+     * Dipakai PrintService untuk cek apakah perlu reconnect atau reuse koneksi.
+     */
+    val connectedMac: String?
+        @SuppressLint("MissingPermission")
+        get() = try {
+            socket?.takeIf { it.isConnected }?.remoteDevice?.address
+        } catch (_: Throwable) {
+            null
+        }
 
     @SuppressLint("MissingPermission")
     suspend fun connect(device: BluetoothDevice, timeoutMs: Long = 15_000L): Result<Unit> =
@@ -57,7 +65,8 @@ object BluetoothPrinter {
         val watchdog = Thread {
             try {
                 Thread.sleep(timeoutMs)
-                if (!operationDone.get()) {
+                // v2.4: pakai compareAndSet supaya atomic dengan operationDone
+                if (operationDone.compareAndSet(false, true)) {
                     watchdogFired.set(true)
                     try { s.close() } catch (_: Throwable) {}
                 }
@@ -71,11 +80,19 @@ object BluetoothPrinter {
 
         return try {
             s.connect()  // blocking; throws IOException kalau watchdog close socket
-            operationDone.set(true)
-            watchdog.interrupt()
-            socket = s
-            outputStream = s.outputStream
-            Result.success(Unit)
+            // v2.4: cek apakah watchdog sudah claim operationDone duluan
+            if (!operationDone.compareAndSet(false, true)) {
+                // Watchdog menang race - close socket yang baru terbentuk
+                try { s.close() } catch (_: Throwable) {}
+                Result.failure(IOException(
+                    "Connect timeout ${timeoutMs}ms — printer mati / sibuk / di luar jangkauan"
+                ))
+            } else {
+                watchdog.interrupt()
+                socket = s
+                outputStream = s.outputStream
+                Result.success(Unit)
+            }
         } catch (t: Throwable) {
             operationDone.set(true)
             watchdog.interrupt()
@@ -90,10 +107,6 @@ object BluetoothPrinter {
         }
     }
 
-    /**
-     * v2.3: write juga pakai watchdog untuk handle kasus printer terima
-     * sebagian data lalu hang (mis. buffer penuh, printer reset).
-     */
     suspend fun writeRaw(data: ByteArray, timeoutMs: Long = 10_000L): Result<Unit> =
         withContext(Dispatchers.IO) {
             ioLock.withLock {
@@ -110,7 +123,7 @@ object BluetoothPrinter {
         val watchdog = Thread {
             try {
                 Thread.sleep(timeoutMs)
-                if (!operationDone.get()) {
+                if (operationDone.compareAndSet(false, true)) {
                     watchdogFired.set(true)
                     try { sock?.close() } catch (_: Throwable) {}
                 }
@@ -123,13 +136,20 @@ object BluetoothPrinter {
         return try {
             os.write(data)
             os.flush()
-            operationDone.set(true)
-            watchdog.interrupt()
-            Result.success(Unit)
+            if (!operationDone.compareAndSet(false, true)) {
+                // watchdog menang race
+                disconnectInternal()
+                Result.failure(IOException(
+                    "Write timeout ${timeoutMs}ms (${data.size} bytes) — printer hang?"
+                ))
+            } else {
+                watchdog.interrupt()
+                Result.success(Unit)
+            }
         } catch (t: Throwable) {
             operationDone.set(true)
             watchdog.interrupt()
-            disconnectInternal()  // socket korup → reset state
+            disconnectInternal()
             if (watchdogFired.get()) {
                 Result.failure(IOException(
                     "Write timeout ${timeoutMs}ms (${data.size} bytes) — printer hang?"

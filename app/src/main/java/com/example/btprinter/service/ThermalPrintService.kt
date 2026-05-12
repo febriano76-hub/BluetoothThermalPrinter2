@@ -17,21 +17,19 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 /**
- * v2.4 fixes for "print web tidak bisa" (manual works, browser print fails):
- *  - Bug 1 FIX: PrintJob lifecycle (start/complete/fail) sekarang dipanggil
- *    dari Dispatchers.Main. Ini bug nomor satu di Android Print Service —
- *    state update dari background thread sering gagal silently sehingga
- *    job stuck di QUEUED dan system tidak pernah deliver dokumen ke kita.
- *  - Bug 2 FIX: Delay 1500ms antara disconnect lama dan connect baru,
- *    supaya RFCOMM session printer ter-teardown sempurna. Banyak printer
- *    thermal BT (terutama murah) tidak bisa terima koneksi baru kalau
- *    yang lama belum sepenuhnya selesai. Plus retry 2x kalau attempt
- *    pertama gagal.
- *  - Bug 3 FIX: Kalau state job sudah bukan QUEUED, kita panggil fail()
- *    bukan diam-diam return — supaya job tidak stuck di queue selamanya.
+ * v2.5 fixes "koneksi mati saat print web":
+ *  - REUSE koneksi yang sudah dibuat MainActivity. Code lama selalu
+ *    disconnect+reconnect tiap job yang justru memutuskan koneksi
+ *    yang sudah work bagus, dan reconnect ke printer thermal BT
+ *    murahan sering gagal karena RFCOMM teardown belum selesai.
+ *  - Setelah print job selesai, JANGAN disconnect — biarkan koneksi
+ *    hidup untuk job berikutnya. UI MainActivity tetap show "Terhubung".
+ *  - Disconnect hanya terjadi kalau: user manual tap "Putus" di app,
+ *    atau koneksi ke MAC berbeda, atau service di-destroy oleh system,
+ *    atau user request cancel print job.
  *
- * v2.3 (sebelumnya):
- *  - Pakai BluetoothPrinter.connect/writeRaw dengan built-in watchdog timeout
+ * v2.4 (sebelumnya): PrintJob lifecycle dari Main thread, job state
+ *  mismatch handling, retry logic.
  */
 class ThermalPrintService : PrintService() {
 
@@ -65,11 +63,12 @@ class ThermalPrintService : PrintService() {
 
     override fun onRequestCancelPrintJob(printJob: PrintJob) {
         Log.d(TAG, "Cancel: ${printJob.info.label}")
-        // FIX Bug 1: PrintJob state methods dari main thread
         scope.launch {
             withContext(Dispatchers.Main) {
                 try { printJob.cancel() } catch (_: Throwable) {}
             }
+            // Tutup koneksi supaya operasi yang sedang berjalan abort.
+            // Setelah cancel, user perlu manual reconnect di MainActivity.
             try { BluetoothPrinter.disconnect() } catch (_: Throwable) {}
         }
     }
@@ -81,14 +80,14 @@ class ThermalPrintService : PrintService() {
     }
 
     private suspend fun runJob(printJob: PrintJob) {
-        // FIX Bug 1: state check + start() dari main thread
+        // PrintJob lifecycle methods harus dari main thread
         val startedOk = withContext(Dispatchers.Main) {
             try {
-                val state = printJob.info.state
                 if (!printJob.isQueued) {
-                    Log.w(TAG, "Job not QUEUED: state=$state")
-                    // FIX Bug 3: jangan diam-diam return — fail supaya job tidak stuck
-                    try { printJob.fail("Job state tidak valid: $state") } catch (_: Throwable) {}
+                    Log.w(TAG, "Job not QUEUED: state=${printJob.info.state}")
+                    try {
+                        printJob.fail("Job state tidak valid: ${printJob.info.state}")
+                    } catch (_: Throwable) {}
                     return@withContext false
                 }
                 printJob.start()
@@ -101,14 +100,12 @@ class ThermalPrintService : PrintService() {
         }
         if (!startedOk) return
 
-        // Lakukan kerja (di IO)
         val result: Result<Unit> = try {
             doPrintJob(printJob)
         } catch (t: Throwable) {
             Result.failure(t)
         }
 
-        // FIX Bug 1: complete/fail dari main thread
         withContext(Dispatchers.Main) {
             if (result.isSuccess) {
                 Log.d(TAG, "Job sukses")
@@ -125,7 +122,11 @@ class ThermalPrintService : PrintService() {
             }
         }
 
-        try { BluetoothPrinter.disconnect() } catch (_: Throwable) {}
+        // PENTING v2.5: JANGAN disconnect di sini!
+        // Biarkan koneksi hidup supaya:
+        //  - Status di MainActivity tetap "Terhubung"
+        //  - Job berikutnya bisa langsung print tanpa reconnect lama
+        //  - Printer tidak di-toggle on/off RFCOMM tiap job
     }
 
     private suspend fun doPrintJob(printJob: PrintJob): Result<Unit> {
@@ -150,42 +151,30 @@ class ThermalPrintService : PrintService() {
             return Result.failure(RuntimeException("Bluetooth tidak aktif"))
         }
 
-        val device = try {
-            adapter.getRemoteDevice(mac)
-        } catch (t: Throwable) {
-            return Result.failure(RuntimeException("MAC tidak valid: ${t.message}", t))
-        }
-
-        // FIX Bug 2: disconnect + delay + retry
-        // RFCOMM session perlu waktu untuk teardown sebelum bisa connect ulang.
-        try { BluetoothPrinter.disconnect() } catch (_: Throwable) {}
-        Log.d(TAG, "Sleep ${RECONNECT_DELAY_MS}ms untuk teardown koneksi lama...")
-        delay(RECONNECT_DELAY_MS)
-
-        var lastErr: Throwable? = null
-        var connected = false
-        for (attempt in 1..CONNECT_RETRY_COUNT) {
-            Log.d(TAG, "Connect attempt $attempt/$CONNECT_RETRY_COUNT " +
-                    "(watchdog ${CONNECT_TIMEOUT_MS}ms)...")
-            val r = BluetoothPrinter.connect(device, CONNECT_TIMEOUT_MS)
-            if (r.isSuccess) {
-                connected = true
-                break
+        // ===== STRATEGI BARU v2.5: Reuse koneksi kalau bisa =====
+        val currentMac = BluetoothPrinter.connectedMac
+        when {
+            currentMac == mac -> {
+                // Koneksi sudah ke device yang diinginkan, langsung pakai
+                Log.d(TAG, "Reuse koneksi yang ada ke $mac, skip connect")
             }
-            lastErr = r.exceptionOrNull()
-            Log.w(TAG, "Attempt $attempt gagal: ${lastErr?.message}")
-            if (attempt < CONNECT_RETRY_COUNT) {
+            currentMac != null -> {
+                // Koneksi ke device lain, perlu switch
+                Log.d(TAG, "Switch koneksi: $currentMac → $mac")
+                try { BluetoothPrinter.disconnect() } catch (_: Throwable) {}
                 delay(RECONNECT_DELAY_MS)
+                val r = connectWithRetry(adapter, mac)
+                if (r.isFailure) return r
+            }
+            else -> {
+                // Belum ada koneksi sama sekali
+                Log.d(TAG, "Belum ada koneksi, connect ke $mac")
+                val r = connectWithRetry(adapter, mac)
+                if (r.isFailure) return r
             }
         }
-        if (!connected) {
-            return Result.failure(RuntimeException(
-                "Connect gagal setelah $CONNECT_RETRY_COUNT attempt: ${lastErr?.message}",
-                lastErr
-            ))
-        }
 
-        Log.d(TAG, "Connected. Processing PDF (target=${prefs.targetWidthPx}px)...")
+        Log.d(TAG, "Processing PDF (target=${prefs.targetWidthPx}px)...")
         val processor = PrintJobProcessor(prefs.targetWidthPx)
         return try {
             processor.process(pfd.fileDescriptor)
@@ -194,5 +183,33 @@ class ThermalPrintService : PrintService() {
                 "Proses PDF: ${t.javaClass.simpleName}: ${t.message}", t
             ))
         }
+    }
+
+    private suspend fun connectWithRetry(
+        adapter: android.bluetooth.BluetoothAdapter,
+        mac: String
+    ): Result<Unit> {
+        val device = try {
+            adapter.getRemoteDevice(mac)
+        } catch (t: Throwable) {
+            return Result.failure(RuntimeException("MAC tidak valid: ${t.message}", t))
+        }
+
+        var lastErr: Throwable? = null
+        for (attempt in 1..CONNECT_RETRY_COUNT) {
+            Log.d(TAG, "Connect attempt $attempt/$CONNECT_RETRY_COUNT " +
+                    "(watchdog ${CONNECT_TIMEOUT_MS}ms)...")
+            val r = BluetoothPrinter.connect(device, CONNECT_TIMEOUT_MS)
+            if (r.isSuccess) return Result.success(Unit)
+            lastErr = r.exceptionOrNull()
+            Log.w(TAG, "Attempt $attempt gagal: ${lastErr?.message}")
+            if (attempt < CONNECT_RETRY_COUNT) {
+                delay(RECONNECT_DELAY_MS)
+            }
+        }
+        return Result.failure(RuntimeException(
+            "Connect gagal setelah $CONNECT_RETRY_COUNT attempt: ${lastErr?.message}",
+            lastErr
+        ))
     }
 }
