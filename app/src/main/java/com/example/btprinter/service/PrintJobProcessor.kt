@@ -13,29 +13,21 @@ import kotlinx.coroutines.delay
 import java.io.File
 
 /**
- * v3.2 FIX "print 1 terputus + print 2 ada garbage di awal":
- *  - Root cause: write timeout mid-raster → disconnect → printer
- *    masih dalam mode raster expecting more data. Print job berikutnya
- *    bytes-nya di-interpret printer sebagai data lanjutan raster lama,
- *    menyebabkan garbage di awal cetakan.
- *  - Fix 1 (preventif): chunk lebih kecil + delay lebih lama + timeout
- *    lebih panjang. Mengurangi kemungkinan disconnect di tengah print.
- *    - CHUNK_HEIGHT_PX 48 → 24 (1.7 KB per chunk untuk 80mm)
- *    - CHUNK_DELAY_MS 80 → 200 (kasih printer waktu print yang cukup)
- *    - CHUNK_WRITE_TIMEOUT_MS 30s → 60s
- *  - Fix 2 (recovery): di awal tiap job, kirim padding NUL byte 2KB
- *    sebelum INIT. Kalau printer punya state corrupt dari job sebelumnya
- *    (masih nunggu raster data), padding ini "menyelesaikan" command
- *    pending. Setelah itu, printer kembali ke command mode, INIT baru
- *    bisa diterima sebagai reset command yang sah.
- *    NUL byte aman: command mode → di-ignore; raster mode → zero-pixel.
+ * v3.3: Cetakan lebih hitam/tegas (lebih banyak kontras).
+ *  - Threshold dinaikkan dari 160 → 200. Pixel dengan luminance < 200
+ *    dianggap hitam (sebelumnya cuma < 160). Hasilnya lebih banyak
+ *    pixel dicetak hitam, termasuk pixel abu-abu terang dari edge
+ *    anti-aliasing teks. Print kelihatan lebih kontras dan readable.
+ *  - Trade-off: pixel "abu-abu sangat terang" dari noise/artifact PDF
+ *    bisa juga jadi hitam. Kalau perlu lebih agresif, naikkan ke 220.
+ *    Kalau terlalu hitam, turunkan ke 180.
  *
+ * v3.2: robust startup (NUL padding) + chunk konservatif (24px, 200ms delay).
  * v3.1: trim trailing whitespace.
- * v3.0: chunk 48, delay 80, write timeout 30s.
  */
 class PrintJobProcessor(
     private val targetWidthPx: Int = 384,
-    private val threshold: Int = 160
+    private val threshold: Int = 200
 ) {
 
     companion object {
@@ -47,7 +39,6 @@ class PrintJobProcessor(
         private const val FEED_WRITE_TIMEOUT_MS = 10_000L
         private const val TRIM_BOTTOM_MARGIN_PX = 24
 
-        // v3.2: padding untuk recovery dari state corrupt
         private const val FLUSH_PADDING_SIZE = 2048
         private const val POST_FLUSH_DELAY_MS = 200L
         private const val POST_INIT_DELAY_MS = 150L
@@ -81,13 +72,13 @@ class PrintJobProcessor(
             }
 
             val r = renderer!!
-            Log.d(TAG, "PDF has ${r.pageCount} page(s), target width = $targetWidthPx px")
+            Log.d(TAG, "PDF has ${r.pageCount} page(s), target width = $targetWidthPx px, " +
+                    "threshold = $threshold")
 
             if (r.pageCount == 0) {
                 return Result.failure(RuntimeException("PDF has 0 pages"))
             }
 
-            // ===== v3.2: Robust startup =====
             val startupResult = robustStartup()
             if (startupResult.isFailure) {
                 return startupResult
@@ -115,12 +106,6 @@ class PrintJobProcessor(
         }
     }
 
-    /**
-     * v3.2: Sebelum INIT, kirim padding NUL byte. Kalau printer punya
-     * pending raster command dari job sebelumnya, padding ini selesaikan
-     * (NUL = zero pixels). Setelah selesai, printer kembali ke command
-     * mode dan INIT bisa diterima dengan benar.
-     */
     private suspend fun robustStartup(): Result<Unit> {
         Log.d(TAG, "Robust startup: kirim ${FLUSH_PADDING_SIZE} byte padding NUL...")
         val flushPadding = ByteArray(FLUSH_PADDING_SIZE) { 0x00 }
@@ -197,7 +182,6 @@ class PrintJobProcessor(
             pageObj.close()
             page = null
 
-            // v3.1: Trim trailing white space
             val contentHeight = findContentBottom(bm, TRIM_BOTTOM_MARGIN_PX)
             if (contentHeight == 0) {
                 Log.d(TAG, "Page $pageIdx kosong sepenuhnya, skip")
@@ -228,8 +212,7 @@ class PrintJobProcessor(
                 ))
             }
 
-            Log.d(TAG, "Page $pageIdx → ${chunks.size} chunk(s) of ${CHUNK_HEIGHT_PX}px each, " +
-                    "delay ${CHUNK_DELAY_MS}ms per chunk")
+            Log.d(TAG, "Page $pageIdx → ${chunks.size} chunk(s) of ${CHUNK_HEIGHT_PX}px each")
 
             for ((i, chunk) in chunks.withIndex()) {
                 val sendResult = BluetoothPrinter.writeRaw(chunk, CHUNK_WRITE_TIMEOUT_MS)
