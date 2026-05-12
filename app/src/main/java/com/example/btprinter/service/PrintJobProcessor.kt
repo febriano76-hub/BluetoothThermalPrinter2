@@ -12,17 +12,16 @@ import com.example.btprinter.util.ImageToEscPos
 import java.io.File
 
 /**
- * v2.8 FIX "file descriptor not seekable":
- *  - PdfRenderer butuh seekable PFD. Print Framework kasih FD pipe yang
- *    tidak seekable, jadi PdfRenderer langsung throw IOException.
- *  - Solusi: terima File regular (sudah di-copy dari pipe oleh caller),
- *    buka ParcelFileDescriptor dari File itu — file regular selalu
- *    seekable. ParcelFileDescriptor.open(File, MODE_READ_ONLY) clean
- *    daripada dup() FD streaming.
+ * v2.9 FIX "page.render: unsupported pixel format":
+ *  - PdfRenderer.Page.render() di AOSP hanya menerima Bitmap.Config.ARGB_8888.
+ *    Format lain (RGB_565, ALPHA_8, dll) langsung throw IllegalArgumentException
+ *    "Unsupported pixel format". Versi sebelumnya pakai RGB_565 dengan
+ *    asumsi hemat memory — itu salah asumsi.
+ *  - Sekarang ARGB_8888 (32-bit). Memory: 576px × 6000px × 4 byte = ~14MB max.
+ *  - maxHeight diturunkan dari 8000 ke 6000 untuk safety di device low-end.
  *
- * v2.1.1: nullable bitmap compile fix
- * v2.1: catch Throwable (OOM), RGB_565 instead of ARGB_8888,
- *  RENDER_MODE_FOR_DISPLAY, pesan error detail
+ * v2.8: terima File langsung untuk PdfRenderer (seekable FD).
+ * v2.1: catch Throwable (OOM), RENDER_MODE_FOR_DISPLAY, pesan error detail.
  */
 class PrintJobProcessor(
     private val targetWidthPx: Int = 384,
@@ -32,12 +31,9 @@ class PrintJobProcessor(
     companion object {
         private const val TAG = "PrintJobProcessor"
         private const val CHUNK_HEIGHT_PX = 128
+        private const val MAX_PAGE_HEIGHT_PX = 6000
     }
 
-    /**
-     * v2.8: terima File (bukan FileDescriptor). Caller harus salin PDF
-     * dari pipe FD ke file regular (di cacheDir) sebelum memanggil ini.
-     */
     suspend fun process(pdfFile: File): Result<Unit> {
         var renderer: PdfRenderer? = null
         var pfd: ParcelFileDescriptor? = null
@@ -125,21 +121,20 @@ class PrintJobProcessor(
 
             val ratio = targetWidthPx.toFloat() / pageWidth
             val targetHeight = (pageHeight * ratio).toInt().coerceAtLeast(1)
-
-            Log.d(TAG, "Page $pageIdx: ${pageWidth}x${pageHeight} pt → " +
-                    "${targetWidthPx}x${targetHeight} px (ratio=$ratio)")
-
-            val maxHeight = 8000
-            val actualHeight = targetHeight.coerceAtMost(maxHeight)
+            val actualHeight = targetHeight.coerceAtMost(MAX_PAGE_HEIGHT_PX)
             if (actualHeight < targetHeight) {
                 Log.w(TAG, "Capping height: $targetHeight → $actualHeight")
             }
 
+            Log.d(TAG, "Page $pageIdx: ${pageWidth}x${pageHeight} pt → " +
+                    "${targetWidthPx}x${actualHeight} px (ratio=$ratio)")
+
+            // v2.9: HARUS ARGB_8888 — PdfRenderer reject format lain
             val bm: Bitmap = try {
-                Bitmap.createBitmap(targetWidthPx, actualHeight, Bitmap.Config.RGB_565)
+                Bitmap.createBitmap(targetWidthPx, actualHeight, Bitmap.Config.ARGB_8888)
             } catch (t: Throwable) {
                 return Result.failure(RuntimeException(
-                    "createBitmap(${targetWidthPx}x${actualHeight}): ${t.message}", t
+                    "createBitmap(${targetWidthPx}x${actualHeight}, ARGB_8888): ${t.message}", t
                 ))
             }
             bitmap = bm
