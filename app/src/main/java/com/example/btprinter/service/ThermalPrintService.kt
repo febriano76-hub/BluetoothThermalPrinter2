@@ -1,7 +1,9 @@
 package com.example.btprinter.service
 
+import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothManager
 import android.content.Context
+import android.os.ParcelFileDescriptor
 import android.printservice.PrintJob
 import android.printservice.PrintService
 import android.printservice.PrinterDiscoverySession
@@ -17,19 +19,16 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 /**
- * v2.5 fixes "koneksi mati saat print web":
- *  - REUSE koneksi yang sudah dibuat MainActivity. Code lama selalu
- *    disconnect+reconnect tiap job yang justru memutuskan koneksi
- *    yang sudah work bagus, dan reconnect ke printer thermal BT
- *    murahan sering gagal karena RFCOMM teardown belum selesai.
- *  - Setelah print job selesai, JANGAN disconnect — biarkan koneksi
- *    hidup untuk job berikutnya. UI MainActivity tetap show "Terhubung".
- *  - Disconnect hanya terjadi kalau: user manual tap "Putus" di app,
- *    atau koneksi ke MAC berbeda, atau service di-destroy oleh system,
- *    atau user request cancel print job.
+ * v2.6 FIX "must be called from the main thread":
+ *  - PrintJob.document.data harus diakses dari Main thread (Android source:
+ *    PrintDocument.getData() memanggil PrintService.throwIfNotCalledOnMainThread()
+ *    sebagai baris pertama). Sekarang kita ambil ParcelFileDescriptor sekaligus
+ *    saat printJob.start() di Main block, lalu pass file descriptor-nya ke
+ *    IO processing — fileDescriptor sendiri tidak terikat thread.
  *
- * v2.4 (sebelumnya): PrintJob lifecycle dari Main thread, job state
- *  mismatch handling, retry logic.
+ * v2.5: Reuse koneksi yang sudah dibuat MainActivity, jangan disconnect
+ *  di akhir job.
+ * v2.4: PrintJob lifecycle dari Main thread, retry logic.
  */
 class ThermalPrintService : PrintService() {
 
@@ -67,45 +66,74 @@ class ThermalPrintService : PrintService() {
             withContext(Dispatchers.Main) {
                 try { printJob.cancel() } catch (_: Throwable) {}
             }
-            // Tutup koneksi supaya operasi yang sedang berjalan abort.
-            // Setelah cancel, user perlu manual reconnect di MainActivity.
             try { BluetoothPrinter.disconnect() } catch (_: Throwable) {}
         }
     }
 
     override fun onPrintJobQueued(printJob: PrintJob) {
+        // onPrintJobQueued sendiri sudah di main thread (callback dari framework)
         Log.d(TAG, "Job queued: ${printJob.info.label}, " +
                 "${printJob.document.info.pageCount} pages")
         scope.launch { runJob(printJob) }
     }
 
+    /**
+     * Hasil dari fase "start on Main": berisi pfd yang sudah aman dipass
+     * ke IO thread untuk processing.
+     */
+    private data class JobStartResult(val pfd: ParcelFileDescriptor)
+
     private suspend fun runJob(printJob: PrintJob) {
-        // PrintJob lifecycle methods harus dari main thread
-        val startedOk = withContext(Dispatchers.Main) {
+        // ===== STEP 1: Validate state, start job, AND fetch pfd (semua di Main) =====
+        val started: JobStartResult? = withContext(Dispatchers.Main) {
             try {
                 if (!printJob.isQueued) {
                     Log.w(TAG, "Job not QUEUED: state=${printJob.info.state}")
                     try {
                         printJob.fail("Job state tidak valid: ${printJob.info.state}")
                     } catch (_: Throwable) {}
-                    return@withContext false
+                    return@withContext null
                 }
-                printJob.start()
-                true
-            } catch (t: Throwable) {
-                Log.e(TAG, "Gagal start", t)
-                try { printJob.fail("Tidak bisa start: ${t.message}") } catch (_: Throwable) {}
-                false
-            }
-        }
-        if (!startedOk) return
 
+                // PENTING v2.6: document.data HARUS diakses di Main thread
+                val pfd: ParcelFileDescriptor? = try {
+                    printJob.document.data
+                } catch (t: Throwable) {
+                    Log.e(TAG, "document.data error", t)
+                    try { printJob.fail("Baca dokumen: ${t.message}") } catch (_: Throwable) {}
+                    return@withContext null
+                }
+                if (pfd == null) {
+                    try { printJob.fail("Dokumen kosong (data null)") } catch (_: Throwable) {}
+                    return@withContext null
+                }
+
+                if (!printJob.start()) {
+                    Log.w(TAG, "printJob.start() returned false")
+                    try { printJob.fail("Gagal start job") } catch (_: Throwable) {}
+                    try { pfd.close() } catch (_: Throwable) {}
+                    return@withContext null
+                }
+
+                JobStartResult(pfd)
+            } catch (t: Throwable) {
+                Log.e(TAG, "Gagal init di Main", t)
+                try { printJob.fail("Init error: ${t.message}") } catch (_: Throwable) {}
+                null
+            }
+        } ?: return
+
+        // ===== STEP 2: Lakukan kerja di IO thread =====
         val result: Result<Unit> = try {
-            doPrintJob(printJob)
+            doPrintJob(started.pfd)
         } catch (t: Throwable) {
             Result.failure(t)
+        } finally {
+            // Tutup pfd kita (PrintJobProcessor sudah pakai dup-nya sendiri)
+            try { started.pfd.close() } catch (_: Throwable) {}
         }
 
+        // ===== STEP 3: Mark complete / fail (di Main) =====
         withContext(Dispatchers.Main) {
             if (result.isSuccess) {
                 Log.d(TAG, "Job sukses")
@@ -122,26 +150,20 @@ class ThermalPrintService : PrintService() {
             }
         }
 
-        // PENTING v2.5: JANGAN disconnect di sini!
-        // Biarkan koneksi hidup supaya:
-        //  - Status di MainActivity tetap "Terhubung"
-        //  - Job berikutnya bisa langsung print tanpa reconnect lama
-        //  - Printer tidak di-toggle on/off RFCOMM tiap job
+        // v2.5: JANGAN disconnect di akhir job — biarkan koneksi hidup
     }
 
-    private suspend fun doPrintJob(printJob: PrintJob): Result<Unit> {
+    /**
+     * v2.6: terima ParcelFileDescriptor langsung (sudah di-fetch di Main thread),
+     * bukan PrintJob. Ini supaya tidak ada akses .document/.info dari IO.
+     */
+    private suspend fun doPrintJob(pfd: ParcelFileDescriptor): Result<Unit> {
         val mac = prefs.lastPrinterMac
         if (mac.isNullOrBlank()) {
             return Result.failure(RuntimeException(
                 "Belum pilih printer. Buka app BT Printer → Hubungkan dulu."
             ))
         }
-
-        val pfd = try {
-            printJob.document.data
-        } catch (t: Throwable) {
-            return Result.failure(RuntimeException("Baca dokumen: ${t.message}", t))
-        } ?: return Result.failure(RuntimeException("Dokumen kosong"))
 
         val btManager = getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
             ?: return Result.failure(RuntimeException("Bluetooth service N/A"))
@@ -151,15 +173,13 @@ class ThermalPrintService : PrintService() {
             return Result.failure(RuntimeException("Bluetooth tidak aktif"))
         }
 
-        // ===== STRATEGI BARU v2.5: Reuse koneksi kalau bisa =====
+        // ===== Reuse koneksi kalau bisa (v2.5) =====
         val currentMac = BluetoothPrinter.connectedMac
         when {
             currentMac == mac -> {
-                // Koneksi sudah ke device yang diinginkan, langsung pakai
                 Log.d(TAG, "Reuse koneksi yang ada ke $mac, skip connect")
             }
             currentMac != null -> {
-                // Koneksi ke device lain, perlu switch
                 Log.d(TAG, "Switch koneksi: $currentMac → $mac")
                 try { BluetoothPrinter.disconnect() } catch (_: Throwable) {}
                 delay(RECONNECT_DELAY_MS)
@@ -167,7 +187,6 @@ class ThermalPrintService : PrintService() {
                 if (r.isFailure) return r
             }
             else -> {
-                // Belum ada koneksi sama sekali
                 Log.d(TAG, "Belum ada koneksi, connect ke $mac")
                 val r = connectWithRetry(adapter, mac)
                 if (r.isFailure) return r
@@ -186,7 +205,7 @@ class ThermalPrintService : PrintService() {
     }
 
     private suspend fun connectWithRetry(
-        adapter: android.bluetooth.BluetoothAdapter,
+        adapter: BluetoothAdapter,
         mac: String
     ): Result<Unit> {
         val device = try {
