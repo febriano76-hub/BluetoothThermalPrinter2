@@ -11,22 +11,27 @@ import com.example.btprinter.PrinterPrefs
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 
 /**
  * Print Service untuk Android print framework.
  *
- * v2.1 improvements:
- *  - Wrap semua operasi di try/catch(Throwable) supaya app tidak crash
- *  - Selalu disconnect + fresh connect untuk tiap print job (state bersih)
- *  - Pesan error lebih detail supaya bisa di-diagnosa dari Print Queue UI
- *  - Catch Throwable (bukan cuma Exception) untuk handle OutOfMemoryError dll
+ * v2.2 improvements:
+ *  - Overall timeout 2 menit untuk job — kalau hang, otomatis fail dengan pesan
+ *  - Timeout 15 detik untuk Bluetooth connect
+ *  - Restructured: handleJob return Result, caller handle state transitions
+ *  - Guarantee: setiap job pasti dapat complete() atau fail() (no leak)
  */
 class ThermalPrintService : PrintService() {
 
     companion object {
         private const val TAG = "ThermalPrintService"
+        private const val OVERALL_TIMEOUT_MS = 120_000L  // 2 menit
+        private const val CONNECT_TIMEOUT_MS = 15_000L   // 15 detik
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -46,134 +51,139 @@ class ThermalPrintService : PrintService() {
     }
 
     override fun onCreatePrinterDiscoverySession(): PrinterDiscoverySession {
-        Log.d(TAG, "onCreatePrinterDiscoverySession")
         return ThermalPrinterDiscoverySession(this, prefs)
     }
 
     override fun onRequestCancelPrintJob(printJob: PrintJob) {
-        Log.d(TAG, "Cancel requested for: ${printJob.info.label}")
+        Log.d(TAG, "Cancel: ${printJob.info.label}")
         try { printJob.cancel() } catch (_: Throwable) {}
     }
 
-    /**
-     * Entry point dari print framework. WRAP DALAM TRY/CATCH untuk hindari
-     * app crash kalau ada exception tak terduga di sini atau di handleJob.
-     */
     override fun onPrintJobQueued(printJob: PrintJob) {
-        try {
-            Log.d(TAG, "Print job queued: ${printJob.info.label}, " +
-                    "${printJob.document.info.pageCount} pages")
+        Log.d(TAG, "Job queued: ${printJob.info.label}, " +
+                "${printJob.document.info.pageCount} pages")
 
-            scope.launch {
-                try {
-                    handleJob(printJob)
-                } catch (t: Throwable) {
-                    Log.e(TAG, "FATAL in handleJob", t)
-                    // Last resort: mark failed dan ke-catch supaya app tidak crash
-                    try {
-                        printJob.fail("Internal error: ${t::class.simpleName}: ${t.message}")
-                    } catch (_: Throwable) { /* nothing more we can do */ }
-                    // Pastikan bluetooth bersih untuk job berikutnya
-                    try { BluetoothPrinter.disconnect() } catch (_: Throwable) {}
-                }
-            }
-        } catch (t: Throwable) {
-            Log.e(TAG, "FATAL in onPrintJobQueued", t)
-            try { printJob.fail("Tidak bisa start: ${t.message}") } catch (_: Throwable) {}
+        scope.launch {
+            runJob(printJob)
         }
     }
 
-    private suspend fun handleJob(printJob: PrintJob) {
-        // Mark sebagai started — kalau gagal, lapor error tapi jangan crash
+    /**
+     * Top-level job runner. JAMINKAN setiap job pasti dapat complete() atau fail().
+     * Pakai overall timeout supaya tidak ada hang yang stuck di "Memproses".
+     */
+    private suspend fun runJob(printJob: PrintJob) {
+        // Phase 1: mark sebagai started
         try {
             if (!printJob.isQueued) {
-                Log.w(TAG, "Print job not in queued state: ${printJob.info.state}")
+                Log.w(TAG, "Job bukan QUEUED state: ${printJob.info.state}, skip")
                 return
             }
             printJob.start()
         } catch (t: Throwable) {
-            Log.e(TAG, "Gagal start print job", t)
+            Log.e(TAG, "Gagal start job", t)
+            safeFail(printJob, "Tidak bisa start: ${t.message}")
             return
         }
 
+        // Phase 2: lakukan kerja dengan timeout
+        val result: Result<Unit> = try {
+            withTimeout(OVERALL_TIMEOUT_MS) {
+                doPrintJob(printJob)
+            }
+        } catch (e: TimeoutCancellationException) {
+            Result.failure(RuntimeException("Timeout 2 menit (proses terlalu lama)"))
+        } catch (t: Throwable) {
+            Result.failure(t)
+        }
+
+        // Phase 3: update state berdasarkan hasil
+        if (result.isSuccess) {
+            Log.d(TAG, "Job sukses")
+            try { printJob.complete() } catch (t: Throwable) {
+                Log.e(TAG, "Gagal mark complete", t)
+            }
+        } else {
+            val err = result.exceptionOrNull()
+            val msg = "${err?.javaClass?.simpleName ?: "Error"}: ${err?.message ?: "tidak diketahui"}"
+            Log.e(TAG, "Job gagal: $msg", err)
+            safeFail(printJob, msg)
+        }
+
+        // Phase 4: cleanup (selalu disconnect)
+        try { BluetoothPrinter.disconnect() } catch (_: Throwable) {}
+    }
+
+    /**
+     * Lakukan print job. Return Result, jangan call printJob.complete/fail di sini —
+     * itu tanggung jawab runJob.
+     */
+    private suspend fun doPrintJob(printJob: PrintJob): Result<Unit> {
         // Cek MAC
         val mac = prefs.lastPrinterMac
         if (mac.isNullOrBlank()) {
-            return failSafe(printJob, "Belum ada printer. Buka aplikasi BT Printer → Hubungkan dulu.")
+            return Result.failure(RuntimeException(
+                "Belum pilih printer. Buka app BT Printer → Hubungkan dulu."
+            ))
         }
 
         // Cek dokumen
         val pfd = try {
             printJob.document.data
         } catch (t: Throwable) {
-            return failSafe(printJob, "Tidak bisa baca dokumen: ${t.message}")
-        }
-        if (pfd == null) {
-            return failSafe(printJob, "Dokumen kosong dari sistem")
-        }
+            return Result.failure(RuntimeException("Baca dokumen: ${t.message}", t))
+        } ?: return Result.failure(RuntimeException("Dokumen kosong dari sistem"))
 
         // Cek Bluetooth
-        val btManager = try {
-            getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
-        } catch (t: Throwable) {
-            return failSafe(printJob, "Bluetooth service error: ${t.message}")
-        }
-        val adapter = btManager?.adapter
-            ?: return failSafe(printJob, "Bluetooth tidak tersedia")
+        val btManager = getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
+            ?: return Result.failure(RuntimeException("Bluetooth service tidak tersedia"))
+        val adapter = btManager.adapter
+            ?: return Result.failure(RuntimeException("Tidak ada Bluetooth adapter"))
         if (!adapter.isEnabled) {
-            return failSafe(printJob, "Bluetooth tidak aktif")
+            return Result.failure(RuntimeException("Bluetooth tidak aktif"))
         }
 
+        // Get device
         val device = try {
             adapter.getRemoteDevice(mac)
         } catch (t: Throwable) {
-            return failSafe(printJob, "MAC printer tidak valid: $mac")
+            return Result.failure(RuntimeException("MAC tidak valid ($mac): ${t.message}", t))
         }
 
-        // v2.1: SELALU disconnect dulu untuk fresh state per job.
-        // Sebelumnya kalau retry, pakai socket lama yang mungkin sudah broken.
-        Log.d(TAG, "Disconnect existing (fresh state)")
+        // Fresh disconnect dulu
         try { BluetoothPrinter.disconnect() } catch (_: Throwable) {}
 
-        Log.d(TAG, "Connecting to $mac...")
-        val connectResult = BluetoothPrinter.connect(device)
+        // Connect dengan timeout
+        Log.d(TAG, "Connecting to $mac with ${CONNECT_TIMEOUT_MS}ms timeout...")
+        val connectResult = withTimeoutOrNull(CONNECT_TIMEOUT_MS) {
+            BluetoothPrinter.connect(device)
+        } ?: return Result.failure(RuntimeException(
+            "Connect timeout ${CONNECT_TIMEOUT_MS / 1000}s — printer mati / sibuk / di luar jangkauan?"
+        ))
+
         if (connectResult.isFailure) {
             val err = connectResult.exceptionOrNull()
-            return failSafe(printJob,
-                "Connect gagal: ${err?.javaClass?.simpleName}: ${err?.message}")
+            return Result.failure(RuntimeException(
+                "Connect gagal: ${err?.javaClass?.simpleName}: ${err?.message}", err
+            ))
         }
 
-        // Proses PDF → ESC/POS
-        Log.d(TAG, "Processing PDF (target width = ${prefs.targetWidthPx}px)...")
+        // Process PDF
+        Log.d(TAG, "Connected. Processing PDF (target=${prefs.targetWidthPx}px)...")
         val processor = PrintJobProcessor(prefs.targetWidthPx)
-        val processResult = try {
+        return try {
             processor.process(pfd.fileDescriptor)
         } catch (t: Throwable) {
-            Log.e(TAG, "Processor threw", t)
-            try { BluetoothPrinter.disconnect() } catch (_: Throwable) {}
-            return failSafe(printJob,
-                "Render gagal: ${t::class.simpleName}: ${t.message}")
-        }
-
-        // Disconnect setelah selesai (sukses atau gagal) supaya activity bisa pakai
-        try { BluetoothPrinter.disconnect() } catch (_: Throwable) {}
-
-        if (processResult.isSuccess) {
-            Log.d(TAG, "Print job complete")
-            try { printJob.complete() } catch (t: Throwable) {
-                Log.e(TAG, "Error marking complete", t)
-            }
-        } else {
-            val err = processResult.exceptionOrNull()
-            failSafe(printJob, "Cetak gagal: ${err?.javaClass?.simpleName}: ${err?.message}")
+            Result.failure(RuntimeException(
+                "Proses PDF: ${t.javaClass.simpleName}: ${t.message}", t
+            ))
         }
     }
 
     /**
      * Mark print job sebagai gagal dengan pesan, tidak throw walaupun gagal mark.
      */
-    private fun failSafe(printJob: PrintJob, message: String) {
-        Log.e(TAG, "FAIL: $message")
+    private fun safeFail(printJob: PrintJob, message: String) {
         try {
             printJob.fail(message)
         } catch (t: Throwable) {
