@@ -9,19 +9,23 @@ import android.util.Log
 import com.example.btprinter.BluetoothPrinter
 import com.example.btprinter.EscPos
 import com.example.btprinter.util.ImageToEscPos
+import kotlinx.coroutines.delay
 import java.io.File
 
 /**
- * v2.9 FIX "page.render: unsupported pixel format":
- *  - PdfRenderer.Page.render() di AOSP hanya menerima Bitmap.Config.ARGB_8888.
- *    Format lain (RGB_565, ALPHA_8, dll) langsung throw IllegalArgumentException
- *    "Unsupported pixel format". Versi sebelumnya pakai RGB_565 dengan
- *    asumsi hemat memory — itu salah asumsi.
- *  - Sekarang ARGB_8888 (32-bit). Memory: 576px × 6000px × 4 byte = ~14MB max.
- *  - maxHeight diturunkan dari 8000 ke 6000 untuk safety di device low-end.
+ * v3.0 FIX "print berhenti & sambungan terputus di tengah jalan":
+ *  - Printer thermal BT punya buffer kecil (8-64 KB). Kirim raster chunk
+ *    terlalu cepat → buffer penuh → flow control → write() block →
+ *    watchdog 10s nyalip → force-close socket → koneksi putus.
+ *  - Tiga lever fix kombinasi:
+ *    1. CHUNK_HEIGHT_PX 128 → 48 (chunk lebih kecil, ~3.5 KB untuk 80mm)
+ *    2. CHUNK_DELAY_MS 0 → 80ms (kasih waktu printer print sebelum kirim
+ *       chunk berikutnya)
+ *    3. Write timeout 10s → 30s (grace period lebih panjang)
  *
- * v2.8: terima File langsung untuk PdfRenderer (seekable FD).
- * v2.1: catch Throwable (OOM), RENDER_MODE_FOR_DISPLAY, pesan error detail.
+ * v2.9: ARGB_8888 untuk PdfRenderer.
+ * v2.8: terima File untuk seekable FD.
+ * v2.1: catch Throwable (OOM), RENDER_MODE_FOR_DISPLAY.
  */
 class PrintJobProcessor(
     private val targetWidthPx: Int = 384,
@@ -30,8 +34,11 @@ class PrintJobProcessor(
 
     companion object {
         private const val TAG = "PrintJobProcessor"
-        private const val CHUNK_HEIGHT_PX = 128
+        private const val CHUNK_HEIGHT_PX = 48
         private const val MAX_PAGE_HEIGHT_PX = 6000
+        private const val CHUNK_DELAY_MS = 80L
+        private const val CHUNK_WRITE_TIMEOUT_MS = 30_000L
+        private const val FEED_WRITE_TIMEOUT_MS = 10_000L
     }
 
     suspend fun process(pdfFile: File): Result<Unit> {
@@ -62,13 +69,15 @@ class PrintJobProcessor(
             }
 
             val r = renderer!!
-            Log.d(TAG, "PDF has ${r.pageCount} page(s), target width = $targetWidthPx px")
+            Log.d(TAG, "PDF has ${r.pageCount} page(s), target width = $targetWidthPx px, " +
+                    "chunk=${CHUNK_HEIGHT_PX}px, delay=${CHUNK_DELAY_MS}ms, " +
+                    "write timeout=${CHUNK_WRITE_TIMEOUT_MS}ms")
 
             if (r.pageCount == 0) {
                 return Result.failure(RuntimeException("PDF has 0 pages"))
             }
 
-            val initResult = BluetoothPrinter.writeRaw(EscPos.INIT)
+            val initResult = BluetoothPrinter.writeRaw(EscPos.INIT, FEED_WRITE_TIMEOUT_MS)
             if (initResult.isFailure) {
                 return Result.failure(RuntimeException(
                     "Init printer gagal: ${initResult.exceptionOrNull()?.message}"
@@ -82,7 +91,7 @@ class PrintJobProcessor(
                 }
             }
 
-            val feedResult = BluetoothPrinter.writeRaw(EscPos.FEED_3)
+            val feedResult = BluetoothPrinter.writeRaw(EscPos.FEED_3, FEED_WRITE_TIMEOUT_MS)
             if (feedResult.isFailure) {
                 Log.w(TAG, "Feed gagal: ${feedResult.exceptionOrNull()?.message}")
             }
@@ -129,7 +138,6 @@ class PrintJobProcessor(
             Log.d(TAG, "Page $pageIdx: ${pageWidth}x${pageHeight} pt → " +
                     "${targetWidthPx}x${actualHeight} px (ratio=$ratio)")
 
-            // v2.9: HARUS ARGB_8888 — PdfRenderer reject format lain
             val bm: Bitmap = try {
                 Bitmap.createBitmap(targetWidthPx, actualHeight, Bitmap.Config.ARGB_8888)
             } catch (t: Throwable) {
@@ -160,15 +168,21 @@ class PrintJobProcessor(
                 ))
             }
 
-            Log.d(TAG, "Page $pageIdx → ${chunks.size} chunk(s)")
+            Log.d(TAG, "Page $pageIdx → ${chunks.size} chunk(s) of ${CHUNK_HEIGHT_PX}px each")
 
+            // v3.0: kirim per chunk dengan timeout panjang & delay antara untuk
+            // kasih printer waktu print & jangan banjiri buffer.
             for ((i, chunk) in chunks.withIndex()) {
-                val sendResult = BluetoothPrinter.writeRaw(chunk)
+                val sendResult = BluetoothPrinter.writeRaw(chunk, CHUNK_WRITE_TIMEOUT_MS)
                 if (sendResult.isFailure) {
                     val err = sendResult.exceptionOrNull()
                     return Result.failure(RuntimeException(
-                        "Send chunk $i/${chunks.size}: ${err?.message}", err
+                        "Send chunk ${i + 1}/${chunks.size}: ${err?.message}", err
                     ))
+                }
+                // Throttle: kasih printer waktu print sebelum chunk berikutnya
+                if (i < chunks.size - 1) {
+                    delay(CHUNK_DELAY_MS)
                 }
             }
 
