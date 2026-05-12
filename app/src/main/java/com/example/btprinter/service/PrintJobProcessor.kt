@@ -13,19 +13,25 @@ import kotlinx.coroutines.delay
 import java.io.File
 
 /**
- * v3.1 FIX "panjang kertas kepanjangan, melebihi panjang invoice":
- *  - MediaSize kita declare tinggi 297mm (A4) di DiscoverySession supaya
- *    struk panjang tidak ter-crop. Konsekuensinya browser kirim PDF
- *    dengan banyak trailing white space.
- *  - Sebelum chunked conversion, scan bitmap dari bawah ke atas cari
- *    baris terbawah yang ada konten (luminance < threshold). Crop
- *    sampai situ + margin 24px (~3mm) untuk visual separation.
- *  - Print stop tepat setelah konten, hemat kertas.
+ * v3.2 FIX "print 1 terputus + print 2 ada garbage di awal":
+ *  - Root cause: write timeout mid-raster → disconnect → printer
+ *    masih dalam mode raster expecting more data. Print job berikutnya
+ *    bytes-nya di-interpret printer sebagai data lanjutan raster lama,
+ *    menyebabkan garbage di awal cetakan.
+ *  - Fix 1 (preventif): chunk lebih kecil + delay lebih lama + timeout
+ *    lebih panjang. Mengurangi kemungkinan disconnect di tengah print.
+ *    - CHUNK_HEIGHT_PX 48 → 24 (1.7 KB per chunk untuk 80mm)
+ *    - CHUNK_DELAY_MS 80 → 200 (kasih printer waktu print yang cukup)
+ *    - CHUNK_WRITE_TIMEOUT_MS 30s → 60s
+ *  - Fix 2 (recovery): di awal tiap job, kirim padding NUL byte 2KB
+ *    sebelum INIT. Kalau printer punya state corrupt dari job sebelumnya
+ *    (masih nunggu raster data), padding ini "menyelesaikan" command
+ *    pending. Setelah itu, printer kembali ke command mode, INIT baru
+ *    bisa diterima sebagai reset command yang sah.
+ *    NUL byte aman: command mode → di-ignore; raster mode → zero-pixel.
  *
- * v3.0: chunk size 48, delay 80ms, write timeout 30s — anti printer
- *  buffer overflow.
- * v2.9: ARGB_8888 untuk PdfRenderer.
- * v2.8: terima File untuk seekable FD.
+ * v3.1: trim trailing whitespace.
+ * v3.0: chunk 48, delay 80, write timeout 30s.
  */
 class PrintJobProcessor(
     private val targetWidthPx: Int = 384,
@@ -34,12 +40,17 @@ class PrintJobProcessor(
 
     companion object {
         private const val TAG = "PrintJobProcessor"
-        private const val CHUNK_HEIGHT_PX = 48
+        private const val CHUNK_HEIGHT_PX = 24
         private const val MAX_PAGE_HEIGHT_PX = 6000
-        private const val CHUNK_DELAY_MS = 80L
-        private const val CHUNK_WRITE_TIMEOUT_MS = 30_000L
+        private const val CHUNK_DELAY_MS = 200L
+        private const val CHUNK_WRITE_TIMEOUT_MS = 60_000L
         private const val FEED_WRITE_TIMEOUT_MS = 10_000L
         private const val TRIM_BOTTOM_MARGIN_PX = 24
+
+        // v3.2: padding untuk recovery dari state corrupt
+        private const val FLUSH_PADDING_SIZE = 2048
+        private const val POST_FLUSH_DELAY_MS = 200L
+        private const val POST_INIT_DELAY_MS = 150L
     }
 
     suspend fun process(pdfFile: File): Result<Unit> {
@@ -76,11 +87,10 @@ class PrintJobProcessor(
                 return Result.failure(RuntimeException("PDF has 0 pages"))
             }
 
-            val initResult = BluetoothPrinter.writeRaw(EscPos.INIT, FEED_WRITE_TIMEOUT_MS)
-            if (initResult.isFailure) {
-                return Result.failure(RuntimeException(
-                    "Init printer gagal: ${initResult.exceptionOrNull()?.message}"
-                ))
+            // ===== v3.2: Robust startup =====
+            val startupResult = robustStartup()
+            if (startupResult.isFailure) {
+                return startupResult
             }
 
             for (pageIdx in 0 until r.pageCount) {
@@ -103,6 +113,34 @@ class PrintJobProcessor(
             try { renderer?.close() } catch (_: Throwable) {}
             try { pfd?.close() } catch (_: Throwable) {}
         }
+    }
+
+    /**
+     * v3.2: Sebelum INIT, kirim padding NUL byte. Kalau printer punya
+     * pending raster command dari job sebelumnya, padding ini selesaikan
+     * (NUL = zero pixels). Setelah selesai, printer kembali ke command
+     * mode dan INIT bisa diterima dengan benar.
+     */
+    private suspend fun robustStartup(): Result<Unit> {
+        Log.d(TAG, "Robust startup: kirim ${FLUSH_PADDING_SIZE} byte padding NUL...")
+        val flushPadding = ByteArray(FLUSH_PADDING_SIZE) { 0x00 }
+        val flushResult = BluetoothPrinter.writeRaw(flushPadding, CHUNK_WRITE_TIMEOUT_MS)
+        if (flushResult.isFailure) {
+            return Result.failure(RuntimeException(
+                "Flush padding: ${flushResult.exceptionOrNull()?.message}"
+            ))
+        }
+        delay(POST_FLUSH_DELAY_MS)
+
+        Log.d(TAG, "Robust startup: kirim INIT...")
+        val initResult = BluetoothPrinter.writeRaw(EscPos.INIT, FEED_WRITE_TIMEOUT_MS)
+        if (initResult.isFailure) {
+            return Result.failure(RuntimeException(
+                "Init printer: ${initResult.exceptionOrNull()?.message}"
+            ))
+        }
+        delay(POST_INIT_DELAY_MS)
+        return Result.success(Unit)
     }
 
     private suspend fun processPage(renderer: PdfRenderer, pageIdx: Int): Result<Unit> {
@@ -159,7 +197,7 @@ class PrintJobProcessor(
             pageObj.close()
             page = null
 
-            // ===== v3.1: Trim trailing white space =====
+            // v3.1: Trim trailing white space
             val contentHeight = findContentBottom(bm, TRIM_BOTTOM_MARGIN_PX)
             if (contentHeight == 0) {
                 Log.d(TAG, "Page $pageIdx kosong sepenuhnya, skip")
@@ -167,8 +205,7 @@ class PrintJobProcessor(
             }
 
             val workingBitmap: Bitmap = if (contentHeight < bm.height) {
-                Log.d(TAG, "Trim white space: ${bm.height} → $contentHeight px " +
-                        "(hemat ${bm.height - contentHeight} px)")
+                Log.d(TAG, "Trim white space: ${bm.height} → $contentHeight px")
                 val cropped = try {
                     Bitmap.createBitmap(bm, 0, 0, bm.width, contentHeight)
                 } catch (t: Throwable) {
@@ -177,7 +214,7 @@ class PrintJobProcessor(
                     ))
                 }
                 bm.recycle()
-                bitmap = cropped  // update reference untuk cleanup di finally
+                bitmap = cropped
                 cropped
             } else {
                 bm
@@ -191,7 +228,8 @@ class PrintJobProcessor(
                 ))
             }
 
-            Log.d(TAG, "Page $pageIdx → ${chunks.size} chunk(s) of ${CHUNK_HEIGHT_PX}px each")
+            Log.d(TAG, "Page $pageIdx → ${chunks.size} chunk(s) of ${CHUNK_HEIGHT_PX}px each, " +
+                    "delay ${CHUNK_DELAY_MS}ms per chunk")
 
             for ((i, chunk) in chunks.withIndex()) {
                 val sendResult = BluetoothPrinter.writeRaw(chunk, CHUNK_WRITE_TIMEOUT_MS)
@@ -216,14 +254,6 @@ class PrintJobProcessor(
         }
     }
 
-    /**
-     * Cari row terbawah dari bitmap yang masih ada konten (pixel hitam
-     * di bawah threshold luminance). Return height untuk crop + margin
-     * trailing. Return 0 kalau bitmap putih sepenuhnya.
-     *
-     * Scan dari bawah ke atas dengan early break, jadi cepat untuk
-     * konten yang menempati hanya bagian atas dari halaman.
-     */
     private fun findContentBottom(bitmap: Bitmap, marginPx: Int): Int {
         val width = bitmap.width
         val height = bitmap.height
@@ -241,6 +271,6 @@ class PrintJobProcessor(
                 }
             }
         }
-        return 0  // semua row putih
+        return 0
     }
 }
