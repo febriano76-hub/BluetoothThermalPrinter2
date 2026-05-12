@@ -26,7 +26,7 @@ import java.io.File
  * v3.1: trim trailing whitespace.
  */
 class PrintJobProcessor(
-    private val targetWidthPx: Int = 388,
+    private val targetWidthPx: Int = 395,
     private val threshold: Int = 200
 ) {
 
