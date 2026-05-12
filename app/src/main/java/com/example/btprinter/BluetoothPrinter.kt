@@ -14,11 +14,7 @@ import java.util.UUID
 /**
  * Singleton koneksi Bluetooth ke printer thermal.
  *
- * Pakai object (singleton) supaya MainActivity dan ThermalPrintService berbagi
- * satu koneksi — tidak rebutan socket Bluetooth.
- *
- * UUID SPP standar dipakai hampir semua printer thermal Bluetooth. Ganti
- * konstanta SPP_UUID kalau printer Anda pakai UUID custom.
+ * v2.1: auto-disconnect saat write gagal supaya state tidak korup untuk operasi berikutnya.
  */
 object BluetoothPrinter {
 
@@ -41,18 +37,16 @@ object BluetoothPrinter {
                 socket = s
                 outputStream = s.outputStream
                 Result.success(Unit)
-            } catch (e: IOException) {
+            } catch (e: Throwable) {
                 disconnectInternal()
-                Result.failure(e)
-            } catch (e: SecurityException) {
                 Result.failure(e)
             }
         }
     }
 
     /**
-     * Tulis byte mentah ke printer. Dipakai untuk teks, ESC/POS commands,
-     * raster bitmap, dll. Caller bertanggung jawab atas isi byte.
+     * Tulis byte mentah ke printer. v2.1: auto-disconnect kalau write gagal,
+     * supaya operasi berikutnya tidak pakai socket yang sudah broken.
      */
     suspend fun writeRaw(data: ByteArray): Result<Unit> = withContext(Dispatchers.IO) {
         ioLock.withLock {
@@ -61,7 +55,9 @@ object BluetoothPrinter {
                 os.write(data)
                 os.flush()
                 Result.success(Unit)
-            } catch (e: IOException) {
+            } catch (e: Throwable) {
+                // Reset state supaya retry/job berikutnya fresh connect
+                disconnectInternal()
                 Result.failure(e)
             }
         }
@@ -84,8 +80,8 @@ object BluetoothPrinter {
     }
 
     private fun disconnectInternal() {
-        try { outputStream?.close() } catch (_: IOException) {}
-        try { socket?.close() } catch (_: IOException) {}
+        try { outputStream?.close() } catch (_: Throwable) {}
+        try { socket?.close() } catch (_: Throwable) {}
         outputStream = null
         socket = null
     }

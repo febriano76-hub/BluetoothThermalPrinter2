@@ -12,46 +12,56 @@ import com.example.btprinter.util.ImageToEscPos
 import java.io.FileDescriptor
 
 /**
- * Memproses dokumen PDF (yang dikirim browser/aplikasi via Print framework)
- * jadi perintah raster ESC/POS, lalu kirim ke printer thermal.
- *
- * Alur:
- *   PDF page → render ke Bitmap @ target width → potong jadi strip horizontal
- *   → masing-masing strip dikonversi ke ESC/POS raster bytes → kirim via BT
+ * v2.1 improvements:
+ *  - Catch Throwable (bukan cuma Exception) untuk handle OOM
+ *  - Pakai RGB_565 (16-bit) instead of ARGB_8888 (32-bit) → halve memory
+ *  - Pakai RENDER_MODE_FOR_DISPLAY (lebih kompatibel dari FOR_PRINT)
+ *  - Pesan error lebih detail di setiap step
  */
 class PrintJobProcessor(
-    private val targetWidthPx: Int = 384,  // 384 untuk 58mm, 576 untuk 80mm
+    private val targetWidthPx: Int = 384,
     private val threshold: Int = 160
 ) {
 
     companion object {
         private const val TAG = "PrintJobProcessor"
-        // Tinggi strip per chunk saat kirim ke printer (mencegah buffer overflow)
         private const val CHUNK_HEIGHT_PX = 128
     }
 
-    /**
-     * Proses seluruh dokumen PDF dari file descriptor.
-     * Asumsi: BluetoothPrinter sudah terhubung.
-     *
-     * @param fileDescriptor FD dari PrintJob.document.data
-     * @return Result.success kalau semua page sukses dicetak
-     */
     suspend fun process(fileDescriptor: FileDescriptor): Result<Unit> {
         var renderer: PdfRenderer? = null
         var pfd: ParcelFileDescriptor? = null
 
         try {
-            pfd = ParcelFileDescriptor.dup(fileDescriptor)
-            renderer = PdfRenderer(pfd)
+            // Step 1: Duplicate file descriptor
+            try {
+                pfd = ParcelFileDescriptor.dup(fileDescriptor)
+            } catch (t: Throwable) {
+                return Result.failure(RuntimeException("dup FD: ${t.message}", t))
+            }
+
+            // Step 2: Open PDF renderer
+            try {
+                renderer = PdfRenderer(pfd!!)
+            } catch (t: Throwable) {
+                return Result.failure(RuntimeException("PdfRenderer: ${t.message}", t))
+            }
 
             Log.d(TAG, "PDF has ${renderer.pageCount} page(s), target width = $targetWidthPx px")
 
-            // Init printer di awal
-            BluetoothPrinter.writeRaw(EscPos.INIT).getOrElse {
-                return Result.failure(it)
+            if (renderer.pageCount == 0) {
+                return Result.failure(RuntimeException("PDF has 0 pages"))
             }
 
+            // Step 3: Init printer
+            val initResult = BluetoothPrinter.writeRaw(EscPos.INIT)
+            if (initResult.isFailure) {
+                return Result.failure(RuntimeException(
+                    "Init printer gagal: ${initResult.exceptionOrNull()?.message}"
+                ))
+            }
+
+            // Step 4: Proses tiap halaman
             for (pageIdx in 0 until renderer.pageCount) {
                 val pageResult = processPage(renderer, pageIdx)
                 if (pageResult.isFailure) {
@@ -59,18 +69,20 @@ class PrintJobProcessor(
                 }
             }
 
-            // Feed di akhir supaya struk keluar dari printer
-            BluetoothPrinter.writeRaw(EscPos.FEED_3).getOrElse {
-                return Result.failure(it)
+            // Step 5: Feed di akhir supaya struk keluar
+            val feedResult = BluetoothPrinter.writeRaw(EscPos.FEED_3)
+            if (feedResult.isFailure) {
+                Log.w(TAG, "Feed gagal: ${feedResult.exceptionOrNull()?.message}")
+                // Bukan critical error, lanjut return success
             }
 
             return Result.success(Unit)
-        } catch (e: Exception) {
-            Log.e(TAG, "Gagal proses PDF", e)
-            return Result.failure(e)
+        } catch (t: Throwable) {
+            Log.e(TAG, "Unexpected error in process()", t)
+            return Result.failure(t)
         } finally {
-            try { renderer?.close() } catch (_: Exception) {}
-            try { pfd?.close() } catch (_: Exception) {}
+            try { renderer?.close() } catch (_: Throwable) {}
+            try { pfd?.close() } catch (_: Throwable) {}
         }
     }
 
@@ -78,49 +90,89 @@ class PrintJobProcessor(
         var page: PdfRenderer.Page? = null
         var bitmap: Bitmap? = null
         try {
-            page = renderer.openPage(pageIdx)
+            // Open page
+            try {
+                page = renderer.openPage(pageIdx)
+            } catch (t: Throwable) {
+                return Result.failure(RuntimeException(
+                    "openPage($pageIdx): ${t.message}", t
+                ))
+            }
 
-            // Hitung tinggi bitmap dengan aspect ratio yang sama
-            val ratio = targetWidthPx.toFloat() / page.width
-            val targetHeight = (page.height * ratio).toInt().coerceAtLeast(1)
+            val pageWidth = page!!.width
+            val pageHeight = page.height
+            if (pageWidth <= 0 || pageHeight <= 0) {
+                return Result.failure(RuntimeException(
+                    "Invalid page size: ${pageWidth}x${pageHeight}"
+                ))
+            }
 
-            Log.d(TAG, "Page $pageIdx: ${page.width}x${page.height} pt → " +
-                    "$targetWidthPx x $targetHeight px (ratio=$ratio)")
+            val ratio = targetWidthPx.toFloat() / pageWidth
+            val targetHeight = (pageHeight * ratio).toInt().coerceAtLeast(1)
 
-            // Render PDF page ke bitmap. Latar putih dulu karena PdfRenderer
-            // tidak otomatis isi background.
-            bitmap = Bitmap.createBitmap(
-                targetWidthPx, targetHeight, Bitmap.Config.ARGB_8888
-            )
+            Log.d(TAG, "Page $pageIdx: ${pageWidth}x${pageHeight} pt → " +
+                    "${targetWidthPx}x${targetHeight} px (ratio=$ratio)")
+
+            // Cap height untuk mencegah OOM di dokumen yang sangat panjang
+            val maxHeight = 8000
+            val actualHeight = targetHeight.coerceAtMost(maxHeight)
+            if (actualHeight < targetHeight) {
+                Log.w(TAG, "Capping height: $targetHeight → $actualHeight")
+            }
+
+            // v2.1: RGB_565 = 2 bytes per pixel (vs ARGB_8888 = 4). Cukup untuk monokrom.
+            bitmap = try {
+                Bitmap.createBitmap(targetWidthPx, actualHeight, Bitmap.Config.RGB_565)
+            } catch (t: Throwable) {
+                return Result.failure(RuntimeException(
+                    "createBitmap(${targetWidthPx}x${actualHeight}): ${t.message}", t
+                ))
+            }
+
+            // White background
             Canvas(bitmap).drawColor(Color.WHITE)
-            page.render(
-                bitmap, null, null,
-                PdfRenderer.Page.RENDER_MODE_FOR_PRINT
-            )
+
+            // Render PDF → bitmap. RENDER_MODE_FOR_DISPLAY lebih kompatibel
+            // (sebagian device crash dengan RENDER_MODE_FOR_PRINT)
+            try {
+                page.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+            } catch (t: Throwable) {
+                return Result.failure(RuntimeException(
+                    "page.render: ${t.message}", t
+                ))
+            }
+
             page.close()
             page = null
 
-            // Bagi jadi strip dan kirim
-            val chunks = ImageToEscPos.convertChunked(
-                bitmap, targetWidthPx, CHUNK_HEIGHT_PX, threshold
-            )
-            Log.d(TAG, "Page $pageIdx split into ${chunks.size} chunk(s)")
+            // Bagi jadi chunk dan kirim
+            val chunks = try {
+                ImageToEscPos.convertChunked(bitmap, targetWidthPx, CHUNK_HEIGHT_PX, threshold)
+            } catch (t: Throwable) {
+                return Result.failure(RuntimeException(
+                    "convertChunked: ${t.message}", t
+                ))
+            }
+
+            Log.d(TAG, "Page $pageIdx → ${chunks.size} chunk(s)")
 
             for ((i, chunk) in chunks.withIndex()) {
-                val result = BluetoothPrinter.writeRaw(chunk)
-                if (result.isFailure) {
-                    Log.e(TAG, "Gagal kirim chunk $i: ${result.exceptionOrNull()?.message}")
-                    return result
+                val sendResult = BluetoothPrinter.writeRaw(chunk)
+                if (sendResult.isFailure) {
+                    val err = sendResult.exceptionOrNull()
+                    return Result.failure(RuntimeException(
+                        "Send chunk $i/${chunks.size}: ${err?.message}", err
+                    ))
                 }
             }
 
             return Result.success(Unit)
-        } catch (e: Exception) {
-            Log.e(TAG, "Gagal proses page $pageIdx", e)
-            return Result.failure(e)
+        } catch (t: Throwable) {
+            Log.e(TAG, "Unexpected error processing page $pageIdx", t)
+            return Result.failure(t)
         } finally {
-            try { page?.close() } catch (_: Exception) {}
-            try { bitmap?.recycle() } catch (_: Exception) {}
+            try { page?.close() } catch (_: Throwable) {}
+            try { bitmap?.recycle() } catch (_: Throwable) {}
         }
     }
 }
