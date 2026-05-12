@@ -12,6 +12,8 @@ import com.example.btprinter.util.ImageToEscPos
 import java.io.FileDescriptor
 
 /**
+ * v2.1.1: fix compile error (nullable bitmap), pakai local non-null val.
+ *
  * v2.1 improvements:
  *  - Catch Throwable (bukan cuma Exception) untuk handle OOM
  *  - Pakai RGB_565 (16-bit) instead of ARGB_8888 (32-bit) → halve memory
@@ -33,27 +35,25 @@ class PrintJobProcessor(
         var pfd: ParcelFileDescriptor? = null
 
         try {
-            // Step 1: Duplicate file descriptor
-            try {
-                pfd = ParcelFileDescriptor.dup(fileDescriptor)
+            pfd = try {
+                ParcelFileDescriptor.dup(fileDescriptor)
             } catch (t: Throwable) {
                 return Result.failure(RuntimeException("dup FD: ${t.message}", t))
             }
 
-            // Step 2: Open PDF renderer
-            try {
-                renderer = PdfRenderer(pfd!!)
+            renderer = try {
+                PdfRenderer(pfd!!)
             } catch (t: Throwable) {
                 return Result.failure(RuntimeException("PdfRenderer: ${t.message}", t))
             }
 
-            Log.d(TAG, "PDF has ${renderer.pageCount} page(s), target width = $targetWidthPx px")
+            val r = renderer!!
+            Log.d(TAG, "PDF has ${r.pageCount} page(s), target width = $targetWidthPx px")
 
-            if (renderer.pageCount == 0) {
+            if (r.pageCount == 0) {
                 return Result.failure(RuntimeException("PDF has 0 pages"))
             }
 
-            // Step 3: Init printer
             val initResult = BluetoothPrinter.writeRaw(EscPos.INIT)
             if (initResult.isFailure) {
                 return Result.failure(RuntimeException(
@@ -61,19 +61,16 @@ class PrintJobProcessor(
                 ))
             }
 
-            // Step 4: Proses tiap halaman
-            for (pageIdx in 0 until renderer.pageCount) {
-                val pageResult = processPage(renderer, pageIdx)
+            for (pageIdx in 0 until r.pageCount) {
+                val pageResult = processPage(r, pageIdx)
                 if (pageResult.isFailure) {
                     return pageResult
                 }
             }
 
-            // Step 5: Feed di akhir supaya struk keluar
             val feedResult = BluetoothPrinter.writeRaw(EscPos.FEED_3)
             if (feedResult.isFailure) {
                 Log.w(TAG, "Feed gagal: ${feedResult.exceptionOrNull()?.message}")
-                // Bukan critical error, lanjut return success
             }
 
             return Result.success(Unit)
@@ -90,17 +87,19 @@ class PrintJobProcessor(
         var page: PdfRenderer.Page? = null
         var bitmap: Bitmap? = null
         try {
-            // Open page
-            try {
-                page = renderer.openPage(pageIdx)
+            page = try {
+                renderer.openPage(pageIdx)
             } catch (t: Throwable) {
                 return Result.failure(RuntimeException(
                     "openPage($pageIdx): ${t.message}", t
                 ))
             }
 
-            val pageWidth = page!!.width
-            val pageHeight = page.height
+            // FIX v2.1.1: pakai local non-null val supaya Kotlin tidak komplain
+            val pageObj: PdfRenderer.Page = page!!
+
+            val pageWidth = pageObj.width
+            val pageHeight = pageObj.height
             if (pageWidth <= 0 || pageHeight <= 0) {
                 return Result.failure(RuntimeException(
                     "Invalid page size: ${pageWidth}x${pageHeight}"
@@ -113,41 +112,37 @@ class PrintJobProcessor(
             Log.d(TAG, "Page $pageIdx: ${pageWidth}x${pageHeight} pt → " +
                     "${targetWidthPx}x${targetHeight} px (ratio=$ratio)")
 
-            // Cap height untuk mencegah OOM di dokumen yang sangat panjang
             val maxHeight = 8000
             val actualHeight = targetHeight.coerceAtMost(maxHeight)
             if (actualHeight < targetHeight) {
                 Log.w(TAG, "Capping height: $targetHeight → $actualHeight")
             }
 
-            // v2.1: RGB_565 = 2 bytes per pixel (vs ARGB_8888 = 4). Cukup untuk monokrom.
-            bitmap = try {
+            // FIX v2.1.1: pakai local non-null val
+            val bm: Bitmap = try {
                 Bitmap.createBitmap(targetWidthPx, actualHeight, Bitmap.Config.RGB_565)
             } catch (t: Throwable) {
                 return Result.failure(RuntimeException(
                     "createBitmap(${targetWidthPx}x${actualHeight}): ${t.message}", t
                 ))
             }
+            bitmap = bm  // simpan reference untuk cleanup di finally
 
-            // White background
-            Canvas(bitmap).drawColor(Color.WHITE)
+            Canvas(bm).drawColor(Color.WHITE)
 
-            // Render PDF → bitmap. RENDER_MODE_FOR_DISPLAY lebih kompatibel
-            // (sebagian device crash dengan RENDER_MODE_FOR_PRINT)
             try {
-                page.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+                pageObj.render(bm, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
             } catch (t: Throwable) {
                 return Result.failure(RuntimeException(
                     "page.render: ${t.message}", t
                 ))
             }
 
-            page.close()
+            pageObj.close()
             page = null
 
-            // Bagi jadi chunk dan kirim
             val chunks = try {
-                ImageToEscPos.convertChunked(bitmap, targetWidthPx, CHUNK_HEIGHT_PX, threshold)
+                ImageToEscPos.convertChunked(bm, targetWidthPx, CHUNK_HEIGHT_PX, threshold)
             } catch (t: Throwable) {
                 return Result.failure(RuntimeException(
                     "convertChunked: ${t.message}", t
