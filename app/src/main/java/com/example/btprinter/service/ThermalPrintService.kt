@@ -19,15 +19,14 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 /**
- * v2.6 FIX "must be called from the main thread":
- *  - PrintJob.document.data harus diakses dari Main thread (Android source:
- *    PrintDocument.getData() memanggil PrintService.throwIfNotCalledOnMainThread()
- *    sebagai baris pertama). Sekarang kita ambil ParcelFileDescriptor sekaligus
- *    saat printJob.start() di Main block, lalu pass file descriptor-nya ke
- *    IO processing — fileDescriptor sendiri tidak terikat thread.
+ * v2.7 FIX compile error: hilangkan type annotation nullable yang
+ *  mencegah smart-cast setelah `?: return`. Sekarang inline pakai
+ *  helper function dan return ParcelFileDescriptor langsung tanpa
+ *  wrapper class — lebih bersih dan compile-friendly.
  *
- * v2.5: Reuse koneksi yang sudah dibuat MainActivity, jangan disconnect
- *  di akhir job.
+ * v2.6: Fix "must be called from the main thread" — document.data
+ *  diakses di Main, file descriptor dipass ke IO.
+ * v2.5: Reuse koneksi yang sudah dibuat MainActivity.
  * v2.4: PrintJob lifecycle dari Main thread, retry logic.
  */
 class ThermalPrintService : PrintService() {
@@ -77,86 +76,91 @@ class ThermalPrintService : PrintService() {
         scope.launch { runJob(printJob) }
     }
 
-    /**
-     * Hasil dari fase "start on Main": berisi pfd yang sudah aman dipass
-     * ke IO thread untuk processing.
-     */
-    private data class JobStartResult(val pfd: ParcelFileDescriptor)
-
     private suspend fun runJob(printJob: PrintJob) {
-        // ===== STEP 1: Validate state, start job, AND fetch pfd (semua di Main) =====
-        val started: JobStartResult? = withContext(Dispatchers.Main) {
-            try {
-                if (!printJob.isQueued) {
-                    Log.w(TAG, "Job not QUEUED: state=${printJob.info.state}")
-                    try {
-                        printJob.fail("Job state tidak valid: ${printJob.info.state}")
-                    } catch (_: Throwable) {}
-                    return@withContext null
-                }
+        // ===== STEP 1: Main thread - validate state, fetch pfd, start =====
+        val pfd = withContext(Dispatchers.Main) {
+            prepareAndStart(printJob)
+        } ?: return  // pfd sekarang non-null (smart-cast lewat ?: return)
 
-                // PENTING v2.6: document.data HARUS diakses di Main thread
-                val pfd: ParcelFileDescriptor? = try {
-                    printJob.document.data
-                } catch (t: Throwable) {
-                    Log.e(TAG, "document.data error", t)
-                    try { printJob.fail("Baca dokumen: ${t.message}") } catch (_: Throwable) {}
-                    return@withContext null
-                }
-                if (pfd == null) {
-                    try { printJob.fail("Dokumen kosong (data null)") } catch (_: Throwable) {}
-                    return@withContext null
-                }
-
-                if (!printJob.start()) {
-                    Log.w(TAG, "printJob.start() returned false")
-                    try { printJob.fail("Gagal start job") } catch (_: Throwable) {}
-                    try { pfd.close() } catch (_: Throwable) {}
-                    return@withContext null
-                }
-
-                JobStartResult(pfd)
-            } catch (t: Throwable) {
-                Log.e(TAG, "Gagal init di Main", t)
-                try { printJob.fail("Init error: ${t.message}") } catch (_: Throwable) {}
-                null
-            }
-        } ?: return
-
-        // ===== STEP 2: Lakukan kerja di IO thread =====
+        // ===== STEP 2: IO thread - lakukan kerja =====
         val result: Result<Unit> = try {
-            doPrintJob(started.pfd)
+            doPrintJob(pfd)
         } catch (t: Throwable) {
             Result.failure(t)
         } finally {
             // Tutup pfd kita (PrintJobProcessor sudah pakai dup-nya sendiri)
-            try { started.pfd.close() } catch (_: Throwable) {}
+            try { pfd.close() } catch (_: Throwable) {}
         }
 
-        // ===== STEP 3: Mark complete / fail (di Main) =====
+        // ===== STEP 3: Main thread - mark complete / fail =====
         withContext(Dispatchers.Main) {
-            if (result.isSuccess) {
-                Log.d(TAG, "Job sukses")
-                try { printJob.complete() } catch (t: Throwable) {
-                    Log.e(TAG, "Mark complete error", t)
-                }
-            } else {
-                val err = result.exceptionOrNull()
-                val msg = "${err?.javaClass?.simpleName ?: "Error"}: ${err?.message ?: "?"}"
-                Log.e(TAG, "Job gagal: $msg", err)
-                try { printJob.fail(msg) } catch (t: Throwable) {
-                    Log.e(TAG, "Mark fail error", t)
-                }
-            }
+            finishJob(printJob, result)
         }
 
         // v2.5: JANGAN disconnect di akhir job — biarkan koneksi hidup
     }
 
     /**
-     * v2.6: terima ParcelFileDescriptor langsung (sudah di-fetch di Main thread),
-     * bukan PrintJob. Ini supaya tidak ada akses .document/.info dari IO.
+     * Validasi state, ambil ParcelFileDescriptor, dan start job.
+     * HARUS dipanggil dari Main thread.
+     * @return PFD kalau sukses, null kalau gagal (sudah mark fail() internal)
      */
+    private fun prepareAndStart(printJob: PrintJob): ParcelFileDescriptor? {
+        return try {
+            if (!printJob.isQueued) {
+                Log.w(TAG, "Job not QUEUED: state=${printJob.info.state}")
+                try {
+                    printJob.fail("Job state tidak valid: ${printJob.info.state}")
+                } catch (_: Throwable) {}
+                return null
+            }
+
+            val pfd: ParcelFileDescriptor = try {
+                printJob.document.data ?: run {
+                    try { printJob.fail("Dokumen kosong (data null)") } catch (_: Throwable) {}
+                    return null
+                }
+            } catch (t: Throwable) {
+                Log.e(TAG, "document.data error", t)
+                try { printJob.fail("Baca dokumen: ${t.message}") } catch (_: Throwable) {}
+                return null
+            }
+
+            if (!printJob.start()) {
+                Log.w(TAG, "printJob.start() returned false")
+                try { printJob.fail("Gagal start job") } catch (_: Throwable) {}
+                try { pfd.close() } catch (_: Throwable) {}
+                return null
+            }
+
+            pfd
+        } catch (t: Throwable) {
+            Log.e(TAG, "Gagal init di Main", t)
+            try { printJob.fail("Init error: ${t.message}") } catch (_: Throwable) {}
+            null
+        }
+    }
+
+    /**
+     * Mark print job sebagai complete atau fail.
+     * HARUS dipanggil dari Main thread.
+     */
+    private fun finishJob(printJob: PrintJob, result: Result<Unit>) {
+        if (result.isSuccess) {
+            Log.d(TAG, "Job sukses")
+            try { printJob.complete() } catch (t: Throwable) {
+                Log.e(TAG, "Mark complete error", t)
+            }
+        } else {
+            val err = result.exceptionOrNull()
+            val msg = "${err?.javaClass?.simpleName ?: "Error"}: ${err?.message ?: "?"}"
+            Log.e(TAG, "Job gagal: $msg", err)
+            try { printJob.fail(msg) } catch (t: Throwable) {
+                Log.e(TAG, "Mark fail error", t)
+            }
+        }
+    }
+
     private suspend fun doPrintJob(pfd: ParcelFileDescriptor): Result<Unit> {
         val mac = prefs.lastPrinterMac
         if (mac.isNullOrBlank()) {
@@ -173,7 +177,7 @@ class ThermalPrintService : PrintService() {
             return Result.failure(RuntimeException("Bluetooth tidak aktif"))
         }
 
-        // ===== Reuse koneksi kalau bisa (v2.5) =====
+        // Reuse koneksi kalau bisa (v2.5)
         val currentMac = BluetoothPrinter.connectedMac
         when {
             currentMac == mac -> {
